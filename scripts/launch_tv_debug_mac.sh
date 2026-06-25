@@ -66,3 +66,5 @@ done
 
 echo "Warning: CDP not responding after 15s. TradingView may still be loading."
 echo "Check manually: curl http://localhost:$PORT/json/version"
+/Applications/TradingView.app/Contents/MacOS/TradingView --remote-debugging-port=9222 &
+curl http://localhost:9222/json/version
