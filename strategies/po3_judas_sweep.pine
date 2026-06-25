@@ -1,0 +1,100 @@
+//@version=6
+// =============================================================================
+// PO3 (Power of Three) - Accumulation / Manipulation / Distribution
+// =============================================================================
+// Pure PO3 / Judas-swing model, with no breakout, ATR, volume, or proximity
+// filters - just the three-phase structure:
+//
+//   1. ACCUMULATION - build a reference range over a defined window.
+//   2. MANIPULATION - price sweeps one side of the range (liquidity grab).
+//   3. DISTRIBUTION - enter on the reclaim back inside the range, in the
+//      OPPOSITE direction of the sweep, targeting the far side.
+//
+//   Sweep below the low  -> long bias  (enter when close reclaims above range low).
+//   Sweep above the high -> short bias (enter when close reclaims below range high).
+//
+// Instrument-agnostic: entry, stop, and target are all derived from the range
+// and the sweep extreme (structure) plus a tick-based stop buffer, so the same
+// settings transfer across ES, NQ, equities, etc. without recalibration.
+// =============================================================================
+
+strategy("PO3 Judas Sweep", overlay=true, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=10, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ---------------- Inputs ----------------
+grpR    = "Accumulation Range"
+accSess = input.session("0930-0945", "Accumulation window", group=grpR)
+tz      = input.string("America/New_York", "Session timezone", group=grpR)
+
+grpE    = "Entry / Exit"
+useOpp   = input.bool(true, "Target the opposite side of the range", group=grpE, tooltip="On: take profit at the far boundary of the accumulation range. Off: use the fixed Reward:Risk multiple below.")
+rr       = input.float(2.0, "Reward : Risk (used when not targeting opposite side)", minval=0.1, step=0.1, group=grpE)
+bufTicks = input.int(2, "Stop buffer (ticks beyond sweep extreme)", minval=0, group=grpE)
+oneTrade = input.bool(true, "Max one trade per session", group=grpE)
+
+// ---------------- Accumulation range ----------------
+inAcc      = not na(time(timeframe.period, accSess, tz))
+newSession = inAcc and not inAcc[1]
+accEnded   = not inAcc and inAcc[1]
+
+var float accHigh   = na
+var float accLow    = na
+var bool  locked    = false
+var int   sweepDir  = 0      // 1 = long bias, -1 = short bias, 0 = no sweep yet
+var float sweepExt  = na     // extreme of the manipulation sweep (for the stop)
+var bool  tradedSes = false
+
+if newSession
+    accHigh   := high
+    accLow    := low
+    locked    := false
+    sweepDir  := 0
+    sweepExt  := na
+    tradedSes := false
+else if inAcc
+    accHigh := math.max(accHigh, high)
+    accLow  := math.min(accLow, low)
+
+if accEnded
+    locked := true
+
+// ---------------- Manipulation (first liquidity sweep) ----------------
+if locked and sweepDir == 0
+    if low < accLow
+        sweepDir := 1
+        sweepExt := low
+    else if high > accHigh
+        sweepDir := -1
+        sweepExt := high
+else if locked and sweepDir == 1
+    sweepExt := math.min(sweepExt, low)   // track the deepest point until reclaim
+else if locked and sweepDir == -1
+    sweepExt := math.max(sweepExt, high)
+
+// ---------------- Distribution (entry on reclaim back inside the range) ----------------
+tradeable  = locked and (not oneTrade or not tradedSes) and strategy.position_size == 0
+longEntry  = tradeable and sweepDir == 1  and close > accLow
+shortEntry = tradeable and sweepDir == -1 and close < accHigh
+
+buf = bufTicks * syminfo.mintick
+
+if longEntry
+    float stop   = sweepExt - buf
+    float target = useOpp ? accHigh : close + (close - stop) * rr
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=stop, limit=target)
+    tradedSes := true
+
+if shortEntry
+    float stop   = sweepExt + buf
+    float target = useOpp ? accLow : close - (stop - close) * rr
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=stop, limit=target)
+    tradedSes := true
+
+// ---------------- Plots ----------------
+plot(locked ? accHigh : na, "Range High", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(locked ? accLow  : na, "Range Low",  color.new(color.red, 0),  2, plot.style_linebr)
+bgcolor(inAcc ? color.new(color.gray, 90) : na, title="Accumulation window")
+
+plotshape(longEntry,  "Long entry",  shape.triangleup,   location.belowbar, color.teal, size=size.small)
+plotshape(shortEntry, "Short entry", shape.triangledown, location.abovebar, color.red,  size=size.small)
