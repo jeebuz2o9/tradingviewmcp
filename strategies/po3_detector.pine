@@ -55,6 +55,7 @@ g_conf = "Confirmation"
 allowSingleCandleCISD = input.bool(false, "Allow Single-Candle CISD (weak, per spec)", group = g_conf)
 requireSweep           = input.bool(true,  "Require Liquidity Sweep of Session Extreme First", group = g_conf)
 requireAMD             = input.bool(true,  "Require 30m/15m AMD (Accum->Manip->Distribution) Confirmation", group = g_conf)
+requireHTFIFVG         = input.bool(true,  "Require 1H/30m Inversion FVG (IFVG) This Session Before Entry", group = g_conf)
 amdAccLen              = input.int(12, "AMD Accumulation Range Length (candles on 30m/15m)", minval = 4, maxval = 60, group = g_conf)
 requireQTiming         = input.bool(true,  "Require Quarterly Theory Timing (entry only in Q2/Q3 of session window)", group = g_conf)
 
@@ -449,18 +450,33 @@ f_amdEngine(_accLen) =>
     _manipShortPending = not na(_manipHighTrigger) and not _distShort
     [_distLong, _distShort, _manipLongPending, _manipShortPending]
 
-[poiTopLong1h, poiBotShort1h]   = request.security(syminfo.tickerid, "60", f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[poiTopLong30m, poiBotShort30m] = request.security(syminfo.tickerid, "30", f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[poiTopLong15m, poiBotShort15m] = request.security(syminfo.tickerid, sigTF15, f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[poiTopLong5m,  poiBotShort5m]  = request.security(syminfo.tickerid, sigTF5,  f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+// Bundled request.security expressions: TradingView caps a script at 40
+// request.*() calls, so everything needed from one symbol+timeframe is
+// fetched in a single tuple instead of separate calls.
+f_poiAmdBundle(_accLen) =>
+    [_pt, _pb] = f_poiEngine()
+    [_dl, _ds, _mlp, _msp] = f_amdEngine(_accLen)
+    [_pt, _pb, _dl, _ds, _mlp, _msp]
 
-[cisdDownOpen15m, cisdDownLen15m, cisdUpOpen15m, cisdUpLen15m] = request.security(syminfo.tickerid, sigTF15, f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[cisdDownOpen5m,  cisdDownLen5m,  cisdUpOpen5m,  cisdUpLen5m]  = request.security(syminfo.tickerid, sigTF5,  f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+f_poiCisdAmdBundle(_accLen) =>
+    [_pt, _pb] = f_poiEngine()
+    [_cd, _cdl, _cu, _cul] = f_cisdEngine()
+    [_dl, _ds, _mlp, _msp] = f_amdEngine(_accLen)
+    [_pt, _pb, _cd, _cdl, _cu, _cul, _dl, _ds, _mlp, _msp]
+
+f_poiCisdBundle() =>
+    [_pt, _pb] = f_poiEngine()
+    [_cd, _cdl, _cu, _cul] = f_cisdEngine()
+    [_pt, _pb, _cd, _cdl, _cu, _cul]
+
+[poiTopLong1h, poiBotShort1h] = request.security(syminfo.tickerid, "60", f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[poiTopLong30m, poiBotShort30m, amdDistLong30m, amdDistShort30m, amdManipLong30m, amdManipShort30m] = request.security(syminfo.tickerid, "30", f_poiAmdBundle(amdAccLen), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[poiTopLong15m, poiBotShort15m, cisdDownOpen15m, cisdDownLen15m, cisdUpOpen15m, cisdUpLen15m, amdDistLong15m, amdDistShort15m, amdManipLong15m, amdManipShort15m] = request.security(syminfo.tickerid, sigTF15, f_poiCisdAmdBundle(amdAccLen), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[poiTopLong5m, poiBotShort5m, cisdDownOpen5m, cisdDownLen5m, cisdUpOpen5m, cisdUpLen5m] = request.security(syminfo.tickerid, sigTF5, f_poiCisdBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 
 // AMD gate: a completed Accumulation -> Manipulation -> Distribution cycle
-// in the trade direction on the 30m or 15m timeline.
-[amdDistLong30m, amdDistShort30m, amdManipLong30m, amdManipShort30m] = request.security(syminfo.tickerid, "30",    f_amdEngine(amdAccLen), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[amdDistLong15m, amdDistShort15m, amdManipLong15m, amdManipShort15m] = request.security(syminfo.tickerid, sigTF15, f_amdEngine(amdAccLen), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+// in the trade direction on the 30m or 15m timeline (fetched in the
+// bundled calls above).
 
 amdGateLong  = not requireAMD or (amdDistLong30m  or amdDistLong15m)
 amdGateShort = not requireAMD or (amdDistShort30m or amdDistShort15m)
@@ -532,9 +548,21 @@ f_sweepEngine() =>
     _sweptHigh = not na(high[1]) and high > high[1] and close < high[1]
     [_sweptLow, _sweptHigh]
 
-[esO1h, esH1h, esL1h, esC1h] = request.security(esSymbol, "60",  [open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+// Bundled per-symbol fetches (see the 40-call cap note above): one call per
+// symbol+timeframe carrying everything that TF feeds into the table/gates.
+f_sym1hBundle() =>
+    [_pt, _pb] = f_poiEngine()
+    [open[1], high[1], low[1], close[1], _pt, _pb, close, close[1]]
+
+f_symTfBundle() =>
+    [_sl, _sh] = f_sweepEngine()
+    [_pt, _pb] = f_poiEngine()
+    [_cd, _cdl, _cu, _cul] = f_cisdEngine()
+    [_sl, _sh, _pt, _pb, _cd, _cdl, _cu, _cul, close, close[1]]
+
+[esO1h, esH1h, esL1h, esC1h, esPoiTop1H, esPoiBot1H, esClose1H, esClosePrev1H] = request.security(esSymbol, "60",  f_sym1hBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 [esO4h, esH4h, esL4h, esC4h] = request.security(esSymbol, "240", [open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqO1h, nqH1h, nqL1h, nqC1h] = request.security(nqSymbol, "60",  [open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[nqO1h, nqH1h, nqL1h, nqC1h, nqPoiTop1H, nqPoiBot1H, nqClose1H, nqClosePrev1H] = request.security(nqSymbol, "60",  f_sym1hBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 [nqO4h, nqH4h, nqL4h, nqC4h] = request.security(nqSymbol, "240", [open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 
 esBias1h = f_htfBias(esH1h, esL1h, esC1h)
@@ -548,25 +576,10 @@ nqBias4h = f_htfBias(nqH4h, nqL4h, nqC4h)
 esBiasIsLong = esBias4h
 nqBiasIsLong = nqBias4h
 
-[esSweptLow30, esSweptHigh30] = request.security(esSymbol, "30",    f_sweepEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[esSweptLow15, esSweptHigh15] = request.security(esSymbol, sigTF15, f_sweepEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqSweptLow30, nqSweptHigh30] = request.security(nqSymbol, "30",    f_sweepEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqSweptLow15, nqSweptHigh15] = request.security(nqSymbol, sigTF15, f_sweepEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-
-[esPoiTop15, esPoiBot15] = request.security(esSymbol, sigTF15, f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[esPoiTop30, esPoiBot30] = request.security(esSymbol, "30",    f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqPoiTop15, nqPoiBot15] = request.security(nqSymbol, sigTF15, f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqPoiTop30, nqPoiBot30] = request.security(nqSymbol, "30",    f_poiEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-
-[esCisdDown15, esCisdDownLen15, esCisdUp15, esCisdUpLen15] = request.security(esSymbol, sigTF15, f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[esCisdDown30, esCisdDownLen30, esCisdUp30, esCisdUpLen30] = request.security(esSymbol, "30",    f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqCisdDown15, nqCisdDownLen15, nqCisdUp15, nqCisdUpLen15] = request.security(nqSymbol, sigTF15, f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqCisdDown30, nqCisdDownLen30, nqCisdUp30, nqCisdUpLen30] = request.security(nqSymbol, "30",    f_cisdEngine(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-
-[esClose15, esClosePrev15] = request.security(esSymbol, sigTF15, [close, close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[esClose30, esClosePrev30] = request.security(esSymbol, "30",    [close, close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqClose15, nqClosePrev15] = request.security(nqSymbol, sigTF15, [close, close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-[nqClose30, nqClosePrev30] = request.security(nqSymbol, "30",    [close, close[1]], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[esSweptLow30, esSweptHigh30, esPoiTop30, esPoiBot30, esCisdDown30, esCisdDownLen30, esCisdUp30, esCisdUpLen30, esClose30, esClosePrev30] = request.security(esSymbol, "30",    f_symTfBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[esSweptLow15, esSweptHigh15, esPoiTop15, esPoiBot15, esCisdDown15, esCisdDownLen15, esCisdUp15, esCisdUpLen15, esClose15, esClosePrev15] = request.security(esSymbol, sigTF15, f_symTfBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[nqSweptLow30, nqSweptHigh30, nqPoiTop30, nqPoiBot30, nqCisdDown30, nqCisdDownLen30, nqCisdUp30, nqCisdUpLen30, nqClose30, nqClosePrev30] = request.security(nqSymbol, "30",    f_symTfBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[nqSweptLow15, nqSweptHigh15, nqPoiTop15, nqPoiBot15, nqCisdDown15, nqCisdDownLen15, nqCisdUp15, nqCisdUpLen15, nqClose15, nqClosePrev15] = request.security(nqSymbol, sigTF15, f_symTfBundle(), lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 
 minRunLen = allowSingleCandleCISD ? 1 : 2
 
@@ -582,6 +595,8 @@ esT1_15L = f_tier1Confirm(esPoiTop15, esClose15, esClosePrev15, true)
 esT1_15S = f_tier1Confirm(esPoiBot15, esClose15, esClosePrev15, false)
 esT1_30L = f_tier1Confirm(esPoiTop30, esClose30, esClosePrev30, true)
 esT1_30S = f_tier1Confirm(esPoiBot30, esClose30, esClosePrev30, false)
+esT1_1HL = f_tier1Confirm(esPoiTop1H, esClose1H, esClosePrev1H, true)
+esT1_1HS = f_tier1Confirm(esPoiBot1H, esClose1H, esClosePrev1H, false)
 esT2_15L = f_tier2Confirm(esCisdDown15, esCisdDownLen15, esClose15, esClosePrev15, true, minRunLen)
 esT2_15S = f_tier2Confirm(esCisdUp15,   esCisdUpLen15,   esClose15, esClosePrev15, false, minRunLen)
 esT2_30L = f_tier2Confirm(esCisdDown30, esCisdDownLen30, esClose30, esClosePrev30, true, minRunLen)
@@ -591,10 +606,65 @@ nqT1_15L = f_tier1Confirm(nqPoiTop15, nqClose15, nqClosePrev15, true)
 nqT1_15S = f_tier1Confirm(nqPoiBot15, nqClose15, nqClosePrev15, false)
 nqT1_30L = f_tier1Confirm(nqPoiTop30, nqClose30, nqClosePrev30, true)
 nqT1_30S = f_tier1Confirm(nqPoiBot30, nqClose30, nqClosePrev30, false)
+nqT1_1HL = f_tier1Confirm(nqPoiTop1H, nqClose1H, nqClosePrev1H, true)
+nqT1_1HS = f_tier1Confirm(nqPoiBot1H, nqClose1H, nqClosePrev1H, false)
 nqT2_15L = f_tier2Confirm(nqCisdDown15, nqCisdDownLen15, nqClose15, nqClosePrev15, true, minRunLen)
 nqT2_15S = f_tier2Confirm(nqCisdUp15,   nqCisdUpLen15,   nqClose15, nqClosePrev15, false, minRunLen)
 nqT2_30L = f_tier2Confirm(nqCisdDown30, nqCisdDownLen30, nqClose30, nqClosePrev30, true, minRunLen)
 nqT2_30S = f_tier2Confirm(nqCisdUp30,   nqCisdUpLen30,   nqClose30, nqClosePrev30, false, minRunLen)
+
+// Latched per-session IFVG flags for the status table: an inversion is a
+// one-bar event, so without latching the table cell would only show it for
+// a single chart bar. Reset at each new tradeable session open.
+var bool esIfvg1HL_s = false
+var bool esIfvg1HS_s = false
+var bool esIfvg30L_s = false
+var bool esIfvg30S_s = false
+var bool esIfvg15L_s = false
+var bool esIfvg15S_s = false
+var bool nqIfvg1HL_s = false
+var bool nqIfvg1HS_s = false
+var bool nqIfvg30L_s = false
+var bool nqIfvg30S_s = false
+var bool nqIfvg15L_s = false
+var bool nqIfvg15S_s = false
+if isNewSessionOpen
+    esIfvg1HL_s := false
+    esIfvg1HS_s := false
+    esIfvg30L_s := false
+    esIfvg30S_s := false
+    esIfvg15L_s := false
+    esIfvg15S_s := false
+    nqIfvg1HL_s := false
+    nqIfvg1HS_s := false
+    nqIfvg30L_s := false
+    nqIfvg30S_s := false
+    nqIfvg15L_s := false
+    nqIfvg15S_s := false
+if esT1_1HL
+    esIfvg1HL_s := true
+if esT1_1HS
+    esIfvg1HS_s := true
+if esT1_30L
+    esIfvg30L_s := true
+if esT1_30S
+    esIfvg30S_s := true
+if esT1_15L
+    esIfvg15L_s := true
+if esT1_15S
+    esIfvg15S_s := true
+if nqT1_1HL
+    nqIfvg1HL_s := true
+if nqT1_1HS
+    nqIfvg1HS_s := true
+if nqT1_30L
+    nqIfvg30L_s := true
+if nqT1_30S
+    nqIfvg30S_s := true
+if nqT1_15L
+    nqIfvg15L_s := true
+if nqT1_15S
+    nqIfvg15S_s := true
 
 // SMT for the table: same swing-divergence formula as smtBearishAtHigh/
 // smtBullishAtLow above, generalized to the explicit ES/NQ pairing (instead
@@ -636,6 +706,30 @@ tier1Long_15m  = not na(poiTopLong15m)  and close > poiTopLong15m  and close[1] 
 tier1Short_15m = not na(poiBotShort15m) and close < poiBotShort15m and close[1] >= poiBotShort15m
 tier1Long_5m   = not na(poiTopLong5m)   and close > poiTopLong5m   and close[1] <= poiTopLong5m
 tier1Short_5m  = not na(poiBotShort5m)  and close < poiBotShort5m  and close[1] >= poiBotShort5m
+
+// ---------------------------------------------------------------------------
+// HTF IFVG respect gate: an inversion of a 1H or 30m FVG must have occurred
+// during the CURRENT session before a long/short can fire. Unlike the
+// momentary tier1 flags above, this LATCHES for the rest of the session once
+// seen (an HTF inversion validates the direction; it doesn't have to happen
+// on the same bar as the entry). Independent of useHTFConfirmation — that
+// input controls whether HTF inversions count as the entry trigger itself.
+// ---------------------------------------------------------------------------
+htfIfvgLongNow  = (not na(poiTopLong1h)  and close > poiTopLong1h  and close[1] <= poiTopLong1h)  or (not na(poiTopLong30m)  and close > poiTopLong30m  and close[1] <= poiTopLong30m)
+htfIfvgShortNow = (not na(poiBotShort1h) and close < poiBotShort1h and close[1] >= poiBotShort1h) or (not na(poiBotShort30m) and close < poiBotShort30m and close[1] >= poiBotShort30m)
+
+var bool htfIfvgLongSeen  = false
+var bool htfIfvgShortSeen = false
+if isNewSessionOpen
+    htfIfvgLongSeen  := false
+    htfIfvgShortSeen := false
+if htfIfvgLongNow
+    htfIfvgLongSeen := true
+if htfIfvgShortNow
+    htfIfvgShortSeen := true
+
+htfIfvgGateLong  = not requireHTFIFVG or htfIfvgLongSeen
+htfIfvgGateShort = not requireHTFIFVG or htfIfvgShortSeen
 
 // ---------------------------------------------------------------------------
 // Tier 2 — CISD: last consecutive run (>=2 candles, configurable) in the
@@ -682,8 +776,7 @@ if sweepShort and not biasIsLong
 // ---------------------------------------------------------------------------
 // SMT divergence (optional confluence) vs a correlated symbol
 // ---------------------------------------------------------------------------
-smtHigh = request.security(smtTicker, timeframe.period, high, lookahead = barmerge.lookahead_off)  // NON-REPAINTING
-smtLow  = request.security(smtTicker, timeframe.period, low,  lookahead = barmerge.lookahead_off)  // NON-REPAINTING
+[smtHigh, smtLow] = request.security(smtTicker, timeframe.period, [high, low], lookahead = barmerge.lookahead_off)  // NON-REPAINTING
 
 primaryHighest    = ta.highest(high, smtLookback)
 primaryLowest     = ta.lowest(low, smtLookback)
@@ -747,8 +840,8 @@ quarterlyGateOk = not requireQTiming or (sessActive and barsInSession >= qtQ2Sta
 // ---------------------------------------------------------------------------
 canEnter = sessActive and not sessTaken and (not requireSweep or sessSwept)
 
-longSignal  = canEnter and biasIsLong       and (tier1Long  or tier2Long)  and smtOkLong  and newsGateOk and newsBiasOkLong  and amdGateLong  and quarterlyGateOk
-shortSignal = canEnter and (not biasIsLong) and (tier1Short or tier2Short) and smtOkShort and newsGateOk and newsBiasOkShort and amdGateShort and quarterlyGateOk
+longSignal  = canEnter and biasIsLong       and (tier1Long  or tier2Long)  and smtOkLong  and newsGateOk and newsBiasOkLong  and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
+shortSignal = canEnter and (not biasIsLong) and (tier1Short or tier2Short) and smtOkShort and newsGateOk and newsBiasOkShort and amdGateShort and quarterlyGateOk and htfIfvgGateShort
 
 if longSignal
     sessTaken := true
@@ -773,10 +866,10 @@ if shortSignal
 canEnter15m = enable15m and sessActive and not sessTaken15m and (not requireSweep or sessSwept)
 canEnter5m  = enable5m  and sessActive and not sessTaken5m  and (not requireSweep or sessSwept)
 
-longSignal_15m  = canEnter15m and biasIsLong       and confLong_15m  and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk
-shortSignal_15m = canEnter15m and (not biasIsLong) and confShort_15m and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk
-longSignal_5m   = canEnter5m  and biasIsLong       and confLong_5m   and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk
-shortSignal_5m  = canEnter5m  and (not biasIsLong) and confShort_5m  and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk
+longSignal_15m  = canEnter15m and biasIsLong       and confLong_15m  and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
+shortSignal_15m = canEnter15m and (not biasIsLong) and confShort_15m and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort
+longSignal_5m   = canEnter5m  and biasIsLong       and confLong_5m   and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
+shortSignal_5m  = canEnter5m  and (not biasIsLong) and confShort_5m  and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort
 
 if longSignal_15m
     sessTaken15m := true
@@ -880,14 +973,20 @@ f_biasCellText(_is4hLong, _is1hLong) =>
     _agree = _is4hLong == _is1hLong
     _dir4h + " -> " + f_drawTarget(_is4hLong) + (_agree ? " (1H+4H agree)" : " (1H " + _dir1h + ")")
 
-f_poiCellText(_isLong, _top15, _bot15, _top30, _bot30) =>
-    _level = _isLong ? (not na(_top15) ? _top15 : _top30) : (not na(_bot15) ? _bot15 : _bot30)
-    _tf    = _isLong ? (not na(_top15) ? "15m" : not na(_top30) ? "30m" : "") : (not na(_bot15) ? "15m" : not na(_bot30) ? "30m" : "")
+f_poiCellText(_isLong, _top15, _bot15, _top30, _bot30, _top1h, _bot1h) =>
+    _level = _isLong ? (not na(_top15) ? _top15 : not na(_top30) ? _top30 : _top1h) : (not na(_bot15) ? _bot15 : not na(_bot30) ? _bot30 : _bot1h)
+    _tf    = _isLong ? (not na(_top15) ? "15m" : not na(_top30) ? "30m" : not na(_top1h) ? "1H" : "") : (not na(_bot15) ? "15m" : not na(_bot30) ? "30m" : not na(_bot1h) ? "1H" : "")
     na(_level) ? "None" : _tf + " FVG " + str.tostring(_level, format.mintick)
 
-f_poiCellColor(_isLong, _top15, _bot15, _top30, _bot30) =>
-    _has = _isLong ? (not na(_top15) or not na(_top30)) : (not na(_bot15) or not na(_bot30))
+f_poiCellColor(_isLong, _top15, _bot15, _top30, _bot30, _top1h, _bot1h) =>
+    _has = _isLong ? (not na(_top15) or not na(_top30) or not na(_top1h)) : (not na(_bot15) or not na(_bot30) or not na(_bot1h))
     _has ? color.new(color.orange, 25) : color.new(color.gray, 50)
+
+// IFVG cell: which timeframes have printed an inversion FVG in the bias
+// direction this session (latched flags). HTF (1H/30m) and LTF (15m) both
+// shown so a lower- vs higher-timeframe inversion is distinguishable.
+f_ifvgCellText(_i1h, _i30, _i15) =>
+    not (_i1h or _i30 or _i15) ? "None" : (_i1h ? "1H ✓ " : "") + (_i30 ? "30m ✓ " : "") + (_i15 ? "15m ✓" : "")
 
 f_sweepCellText(_relevant30, _relevant15) =>
     _relevant30 and _relevant15 ? "30m+15m swept" : _relevant30 ? "30m swept" : _relevant15 ? "15m swept" : "pending"
@@ -925,7 +1024,12 @@ esSmtConflict   = esBiasIsLong ? esBearSMT : esBullSMT
 nqSmtSupportive = nqBiasIsLong ? nqBullSMT : nqBearSMT
 nqSmtConflict   = nqBiasIsLong ? nqBearSMT : nqBullSMT
 
-var table statusTbl = table.new(tblPos, 6, 4, border_width = 1)
+esIfvgText = esBiasIsLong ? f_ifvgCellText(esIfvg1HL_s, esIfvg30L_s, esIfvg15L_s) : f_ifvgCellText(esIfvg1HS_s, esIfvg30S_s, esIfvg15S_s)
+nqIfvgText = nqBiasIsLong ? f_ifvgCellText(nqIfvg1HL_s, nqIfvg30L_s, nqIfvg15L_s) : f_ifvgCellText(nqIfvg1HS_s, nqIfvg30S_s, nqIfvg15S_s)
+esIfvgAny  = esBiasIsLong ? (esIfvg1HL_s or esIfvg30L_s or esIfvg15L_s) : (esIfvg1HS_s or esIfvg30S_s or esIfvg15S_s)
+nqIfvgAny  = nqBiasIsLong ? (nqIfvg1HL_s or nqIfvg30L_s or nqIfvg15L_s) : (nqIfvg1HS_s or nqIfvg30S_s or nqIfvg15S_s)
+
+var table statusTbl = table.new(tblPos, 7, 4, border_width = 1)
 if showStatusTable and barstate.islast
     sessionCellTxt = "Sess: " + (sessActive ? sessName : "None") + (inNYKillZone ? " [NYKZ]" : inAsiaKillZone ? " [AsiaKZ]" : "")
     anchorCellTxt  = "Next 4H: " + f_fmtCountdown(minsToNextAnchor) + (inMacroWindow ? " (macro)" : "")
@@ -935,28 +1039,31 @@ if showStatusTable and barstate.islast
     table.cell(statusTbl, 2, 0, anchorCellTxt, text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = tblSz)
     table.merge_cells(statusTbl, 2, 0, 3, 0)
     table.cell(statusTbl, 4, 0, newsCellTxt, text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = tblSz)
-    table.merge_cells(statusTbl, 4, 0, 5, 0)
+    table.merge_cells(statusTbl, 4, 0, 6, 0)
 
     table.cell(statusTbl, 0, 1, "Symbol", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 1, 1, "HTF Bias+Draw", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 2, 1, "POI", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 3, 1, "Sweep", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 4, 1, "Confirm", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
-    table.cell(statusTbl, 5, 1, "SMT", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 5, 1, "IFVG", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 6, 1, "SMT", text_color = color.white, bgcolor = color.new(color.gray, 50), text_size = tblSz)
 
     table.cell(statusTbl, 0, 2, "ES", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = tblSz)
     table.cell(statusTbl, 1, 2, f_biasCellText(esBias4h, esBias1h), text_color = color.white, bgcolor = color.new(color.green, 70), text_size = tblSz)
-    table.cell(statusTbl, 2, 2, f_poiCellText(esBiasIsLong, esPoiTop15, esPoiBot15, esPoiTop30, esPoiBot30), text_color = color.white, bgcolor = f_poiCellColor(esBiasIsLong, esPoiTop15, esPoiBot15, esPoiTop30, esPoiBot30), text_size = tblSz)
+    table.cell(statusTbl, 2, 2, f_poiCellText(esBiasIsLong, esPoiTop15, esPoiBot15, esPoiTop30, esPoiBot30, esPoiTop1H, esPoiBot1H), text_color = color.white, bgcolor = f_poiCellColor(esBiasIsLong, esPoiTop15, esPoiBot15, esPoiTop30, esPoiBot30, esPoiTop1H, esPoiBot1H), text_size = tblSz)
     table.cell(statusTbl, 3, 2, f_sweepCellText(esSweptRelevant30, esSweptRelevant15), text_color = color.white, bgcolor = (esSweptRelevant30 or esSweptRelevant15) ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 4, 2, esConfText, text_color = color.white, bgcolor = esConfValid ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
-    table.cell(statusTbl, 5, 2, f_smtCellText(esSmtSupportive, esSmtConflict), text_color = color.white, bgcolor = esSmtSupportive ? color.new(color.green, 70) : esSmtConflict ? color.new(color.orange, 70) : color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 5, 2, esIfvgText, text_color = color.white, bgcolor = esIfvgAny ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 6, 2, f_smtCellText(esSmtSupportive, esSmtConflict), text_color = color.white, bgcolor = esSmtSupportive ? color.new(color.green, 70) : esSmtConflict ? color.new(color.orange, 70) : color.new(color.gray, 50), text_size = tblSz)
 
     table.cell(statusTbl, 0, 3, "NQ", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = tblSz)
     table.cell(statusTbl, 1, 3, f_biasCellText(nqBias4h, nqBias1h), text_color = color.white, bgcolor = color.new(color.green, 70), text_size = tblSz)
-    table.cell(statusTbl, 2, 3, f_poiCellText(nqBiasIsLong, nqPoiTop15, nqPoiBot15, nqPoiTop30, nqPoiBot30), text_color = color.white, bgcolor = f_poiCellColor(nqBiasIsLong, nqPoiTop15, nqPoiBot15, nqPoiTop30, nqPoiBot30), text_size = tblSz)
+    table.cell(statusTbl, 2, 3, f_poiCellText(nqBiasIsLong, nqPoiTop15, nqPoiBot15, nqPoiTop30, nqPoiBot30, nqPoiTop1H, nqPoiBot1H), text_color = color.white, bgcolor = f_poiCellColor(nqBiasIsLong, nqPoiTop15, nqPoiBot15, nqPoiTop30, nqPoiBot30, nqPoiTop1H, nqPoiBot1H), text_size = tblSz)
     table.cell(statusTbl, 3, 3, f_sweepCellText(nqSweptRelevant30, nqSweptRelevant15), text_color = color.white, bgcolor = (nqSweptRelevant30 or nqSweptRelevant15) ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 4, 3, nqConfText, text_color = color.white, bgcolor = nqConfValid ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
-    table.cell(statusTbl, 5, 3, f_smtCellText(nqSmtSupportive, nqSmtConflict), text_color = color.white, bgcolor = nqSmtSupportive ? color.new(color.green, 70) : nqSmtConflict ? color.new(color.orange, 70) : color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 5, 3, nqIfvgText, text_color = color.white, bgcolor = nqIfvgAny ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
+    table.cell(statusTbl, 6, 3, f_smtCellText(nqSmtSupportive, nqSmtConflict), text_color = color.white, bgcolor = nqSmtSupportive ? color.new(color.green, 70) : nqSmtConflict ? color.new(color.orange, 70) : color.new(color.gray, 50), text_size = tblSz)
 
 // ---------------------------------------------------------------------------
 // Notes / known limitations (kept as comments, not invented behavior):
