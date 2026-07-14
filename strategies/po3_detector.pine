@@ -129,6 +129,16 @@ newsLbl12  = input.string("",  "Event 12 Label", group = g_news)
 g_out = "Output"
 showStatusTable = input.bool(true, "Show Status Table", group = g_out)
 
+g_kl = "Key Levels (Daily / Weekly / Monthly / Quarterly)"
+showKeyLevels   = input.bool(true,  "Draw Key Levels", group = g_kl)
+klDailyOn       = input.bool(true,  "Daily: DO / PDH / PDL", group = g_kl)
+klWeeklyOn      = input.bool(true,  "Weekly: WO / PWH / PWL", group = g_kl)
+klMonthlyOn     = input.bool(true,  "Monthly: MO / PMH / PML", group = g_kl)
+klQuarterlyOn   = input.bool(false, "Quarterly: QO / PQH / PQL", group = g_kl)
+klMidsOn        = input.bool(false, "Include Prev Mid Levels (PDM/PWM/PMM/PQM)", group = g_kl)
+klExtendBars    = input.int(30, "Level Line Extend (bars)", minval = 5, maxval = 300, group = g_kl)
+klTolerancePct  = input.float(0.1, "Key-Level Sweep Confluence Tolerance (%)", minval = 0.01, maxval = 2.0, step = 0.01, group = g_kl)
+
 g_tbl = "Status Table (ES / NQ)"
 esSymbol    = input.symbol("ES1!", "ES Symbol", group = g_tbl)
 nqSymbol    = input.symbol("NQ1!", "NQ Symbol", group = g_tbl)
@@ -216,6 +226,73 @@ dailyBiasIsLong = closePos >= 0.5
 
 biasIsLong  = biasModeStr == "Long" ? true : biasModeStr == "Short" ? false : dailyBiasIsLong
 biasLabel   = biasModeStr == "Auto" ? (dailyBiasIsLong ? "Long (auto)" : "Short (auto)") : biasModeStr
+
+// ---------------------------------------------------------------------------
+// Key levels (ported from the SpacemanBTC IDWM key-levels concept): current
+// period opens plus PREVIOUS completed period highs/lows (and optional mids)
+// for Daily / Weekly / Monthly / Quarterly. Opens are fetched with
+// lookahead_on (an open is fixed the moment the period starts — standard,
+// non-repainting for opens); highs/lows use the [1]-offset previous candle
+// so they never repaint either.
+// ---------------------------------------------------------------------------
+[klDayOpen, klPDH, klPDL] = request.security(syminfo.tickerid, "D",  [open, high[1], low[1]], lookahead = barmerge.lookahead_on)
+[klWkOpen,  klPWH, klPWL] = request.security(syminfo.tickerid, "W",  [open, high[1], low[1]], lookahead = barmerge.lookahead_on)
+[klMoOpen,  klPMH, klPML] = request.security(syminfo.tickerid, "M",  [open, high[1], low[1]], lookahead = barmerge.lookahead_on)
+[klQtOpen,  klPQH, klPQL] = request.security(syminfo.tickerid, "3M", [open, high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+klPDM = (klPDH + klPDL) / 2
+klPWM = (klPWH + klPWL) / 2
+klPMM = (klPMH + klPML) / 2
+klPQM = (klPQH + klPQL) / 2
+
+// Rebuilt each bar so both the drawing block and the sweep-confluence tag
+// always see the current toggles/values.
+klLevels = array.new_float()
+klNames  = array.new_string()
+f_klPush(_lvl, _name) =>
+    if not na(_lvl)
+        array.push(klLevels, _lvl)
+        array.push(klNames, _name)
+
+if klDailyOn
+    f_klPush(klDayOpen, "DO")
+    f_klPush(klPDH, "PDH")
+    f_klPush(klPDL, "PDL")
+    if klMidsOn
+        f_klPush(klPDM, "PDM")
+if klWeeklyOn
+    f_klPush(klWkOpen, "WO")
+    f_klPush(klPWH, "PWH")
+    f_klPush(klPWL, "PWL")
+    if klMidsOn
+        f_klPush(klPWM, "PWM")
+if klMonthlyOn
+    f_klPush(klMoOpen, "MO")
+    f_klPush(klPMH, "PMH")
+    f_klPush(klPML, "PML")
+    if klMidsOn
+        f_klPush(klPMM, "PMM")
+if klQuarterlyOn
+    f_klPush(klQtOpen, "QO")
+    f_klPush(klPQH, "PQH")
+    f_klPush(klPQL, "PQL")
+    if klMidsOn
+        f_klPush(klPQM, "PQM")
+
+// Nearest key level within tolerance of a price — used to tag entries whose
+// manipulation sweep ran into a Daily/Weekly/Monthly/Quarterly level (i.e.
+// the sweep took liquidity resting at a level every desk is watching).
+f_keyLevelTag(_price) =>
+    _tol = _price * klTolerancePct / 100
+    _bestName = ""
+    _bestDist = _tol
+    if array.size(klLevels) > 0 and not na(_price)
+        for i = 0 to array.size(klLevels) - 1
+            _d = math.abs(array.get(klLevels, i) - _price)
+            if _d <= _bestDist
+                _bestDist := _d
+                _bestName := array.get(klNames, i)
+    _bestName == "" ? "" : " [KL: " + _bestName + "]"
 
 // ---------------------------------------------------------------------------
 // FVG detection (3-candle imbalance) + mitigation tracking — chart timeframe,
@@ -836,6 +913,11 @@ qtQ2StartBars   = math.round(barsPerCutoff * 0.25)
 qtQ4StartBars   = math.round(barsPerCutoff * 0.75)
 quarterlyGateOk = not requireQTiming or (sessActive and barsInSession >= qtQ2StartBars and barsInSession <= qtQ4StartBars)
 
+// Key-level confluence tag for the stop/manipulation level: did this
+// session's sweep land on a Daily/Weekly/Monthly/Quarterly level.
+klTagLong  = f_keyLevelTag(na(manipExtreme) ? sessLow : manipExtreme)
+klTagShort = f_keyLevelTag(na(manipExtreme) ? sessHigh : manipExtreme)
+
 // Entry assembly — chart timeframe (original behavior, unchanged gates)
 // ---------------------------------------------------------------------------
 canEnter = sessActive and not sessTaken and (not requireSweep or sessSwept)
@@ -847,15 +929,15 @@ if longSignal
     sessTaken := true
     stopLevel = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel, bar_index + boxExtendBars, stopLevel, color = color.red, style = line.style_dashed)
-    label.new(bar_index, low, text = "PO3 LONG (" + sessName + ")\n" + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 LONG (" + sessName + ")\n" + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong, alert.freq_once_per_bar)
 
 if shortSignal
     sessTaken := true
     stopLevel = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel, bar_index + boxExtendBars, stopLevel, color = color.red, style = line.style_dashed)
-    label.new(bar_index, high, text = "PO3 SHORT (" + sessName + ")\n" + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 SHORT (" + sessName + ")\n" + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort, alert.freq_once_per_bar)
 
 // ---------------------------------------------------------------------------
 // Entry assembly — independent 15m / 5m signals. Same session/manipulation
@@ -875,29 +957,29 @@ if longSignal_15m
     sessTaken15m := true
     stopLevel15 = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel15, bar_index + boxExtendBars, stopLevel15, color = color.orange, style = line.style_dotted)
-    label.new(bar_index, low, text = "PO3 15m LONG (" + sessName + ")\n" + confSrc_15m_long + amdTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.lime, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_long + amdTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 15m LONG (" + sessName + ")\n" + confSrc_15m_long + amdTagLong + klTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.lime, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_long + amdTagLong + klTagLong, alert.freq_once_per_bar)
 
 if shortSignal_15m
     sessTaken15m := true
     stopLevel15 = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel15, bar_index + boxExtendBars, stopLevel15, color = color.orange, style = line.style_dotted)
-    label.new(bar_index, high, text = "PO3 15m SHORT (" + sessName + ")\n" + confSrc_15m_short + amdTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.orange, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_short + amdTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 15m SHORT (" + sessName + ")\n" + confSrc_15m_short + amdTagShort + klTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.orange, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_short + amdTagShort + klTagShort, alert.freq_once_per_bar)
 
 if longSignal_5m
     sessTaken5m := true
     stopLevel5 = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel5, bar_index + boxExtendBars, stopLevel5, color = color.aqua, style = line.style_dotted)
-    label.new(bar_index, low, text = "PO3 5m LONG (" + sessName + ")\n" + confSrc_5m_long + amdTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.aqua, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_long + amdTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 5m LONG (" + sessName + ")\n" + confSrc_5m_long + amdTagLong + klTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.aqua, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_long + amdTagLong + klTagLong, alert.freq_once_per_bar)
 
 if shortSignal_5m
     sessTaken5m := true
     stopLevel5 = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel5, bar_index + boxExtendBars, stopLevel5, color = color.fuchsia, style = line.style_dotted)
-    label.new(bar_index, high, text = "PO3 5m SHORT (" + sessName + ")\n" + confSrc_5m_short + amdTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.fuchsia, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_short + amdTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 5m SHORT (" + sessName + ")\n" + confSrc_5m_short + amdTagShort + klTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.fuchsia, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_short + amdTagShort + klTagShort, alert.freq_once_per_bar)
 
 // ---------------------------------------------------------------------------
 // Alerts: a small fixed set of alertcondition()s for the Create Alert dialog
@@ -1064,6 +1146,34 @@ if showStatusTable and barstate.islast
     table.cell(statusTbl, 4, 3, nqConfText, text_color = color.white, bgcolor = nqConfValid ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 5, 3, nqIfvgText, text_color = color.white, bgcolor = nqIfvgAny ? color.new(color.green, 70) : color.new(color.gray, 50), text_size = tblSz)
     table.cell(statusTbl, 6, 3, f_smtCellText(nqSmtSupportive, nqSmtConflict), text_color = color.white, bgcolor = nqSmtSupportive ? color.new(color.green, 70) : nqSmtConflict ? color.new(color.orange, 70) : color.new(color.gray, 50), text_size = tblSz)
+
+// ---------------------------------------------------------------------------
+// Key-level drawing: redraw the toggled Daily/Weekly/Monthly/Quarterly lines
+// and labels on the last bar (delete-and-redraw keeps them pinned to the
+// latest values without accumulating stale objects).
+// ---------------------------------------------------------------------------
+f_klColor(_name) =>
+    _p = str.substring(_name, 0, 1)
+    _name == "DO" or _p == "P" and str.substring(_name, 1, 2) == "D" ? #08bcd4 :
+      _name == "WO" or _p == "P" and str.substring(_name, 1, 2) == "W" ? #fffcbc :
+      _name == "MO" or _p == "P" and str.substring(_name, 1, 2) == "M" ? #08d48c : color.red
+
+var line[]  klLines  = array.new<line>()
+var label[] klLabels = array.new<label>()
+if showKeyLevels and barstate.islast
+    for ln in klLines
+        line.delete(ln)
+    for lb in klLabels
+        label.delete(lb)
+    array.clear(klLines)
+    array.clear(klLabels)
+    if array.size(klLevels) > 0
+        for i = 0 to array.size(klLevels) - 1
+            lvl  = array.get(klLevels, i)
+            nm   = array.get(klNames, i)
+            clr  = f_klColor(nm)
+            array.push(klLines,  line.new(bar_index, lvl, bar_index + klExtendBars, lvl, color = clr, style = line.style_solid, width = 1))
+            array.push(klLabels, label.new(bar_index + klExtendBars, lvl, text = nm, style = label.style_none, textcolor = clr, size = size.small))
 
 // ---------------------------------------------------------------------------
 // Notes / known limitations (kept as comments, not invented behavior):
