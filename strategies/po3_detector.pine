@@ -139,6 +139,14 @@ klMidsOn        = input.bool(false, "Include Prev Mid Levels (PDM/PWM/PMM/PQM)",
 klExtendBars    = input.int(30, "Level Line Extend (bars)", minval = 5, maxval = 300, group = g_kl)
 klTolerancePct  = input.float(0.1, "Key-Level Sweep Confluence Tolerance (%)", minval = 0.01, maxval = 2.0, step = 0.01, group = g_kl)
 
+g_vwap = "VWAP / Auction Market Theory"
+showVwap       = input.bool(true, "Show VWAP + Bands", group = g_vwap)
+vwapAnchorStr  = input.string("Session", "VWAP Anchor Period", options = ["Session", "Week", "Month", "Quarter"], group = g_vwap)
+vwapBandMult1  = input.float(1.0, "Value Area Band Multiplier (st.dev)", minval = 0.25, step = 0.25, group = g_vwap)
+vwapBandMult2  = input.float(2.0, "Excess Band Multiplier (st.dev)", minval = 0.5, step = 0.25, group = g_vwap)
+requireVwapAMT = input.bool(true, "Require Auction (VWAP) Confluence at Entry", group = g_vwap,
+     tooltip = "Auction Market Theory read: longs need price accepted above VWAP (initiative buying) OR the manipulation sweep to have reached below the lower value-area band (rejection of undervalue). Shorts mirror.")
+
 g_tbl = "Status Table (ES / NQ)"
 esSymbol    = input.symbol("ES1!", "ES Symbol", group = g_tbl)
 nqSymbol    = input.symbol("NQ1!", "NQ Symbol", group = g_tbl)
@@ -293,6 +301,26 @@ f_keyLevelTag(_price) =>
                 _bestDist := _d
                 _bestName := array.get(klNames, i)
     _bestName == "" ? "" : " [KL: " + _bestName + "]"
+
+// ---------------------------------------------------------------------------
+// Anchored VWAP + standard-deviation bands (ported from TradingView's VWAP).
+// Auction Market Theory framing: VWAP is the session's fair value, the ±1
+// st.dev bands approximate the value area, and the ±2 bands mark excess.
+// ---------------------------------------------------------------------------
+vwapNewPeriod = switch vwapAnchorStr
+    "Session" => timeframe.change("D")
+    "Week"    => timeframe.change("W")
+    "Month"   => timeframe.change("M")
+    => timeframe.change("3M")
+if na(hlc3[1])
+    vwapNewPeriod := true
+
+[vwapValue, vwapStdevUp, vwapStdevLo] = ta.vwap(hlc3, vwapNewPeriod, 1)
+vwapStdevAbs = vwapStdevUp - vwapValue
+vwapUpper1   = vwapValue + vwapStdevAbs * vwapBandMult1
+vwapLower1   = vwapValue - vwapStdevAbs * vwapBandMult1
+vwapUpper2   = vwapValue + vwapStdevAbs * vwapBandMult2
+vwapLower2   = vwapValue - vwapStdevAbs * vwapBandMult2
 
 // ---------------------------------------------------------------------------
 // FVG detection (3-candle imbalance) + mitigation tracking — chart timeframe,
@@ -918,26 +946,38 @@ quarterlyGateOk = not requireQTiming or (sessActive and barsInSession >= qtQ2Sta
 klTagLong  = f_keyLevelTag(na(manipExtreme) ? sessLow : manipExtreme)
 klTagShort = f_keyLevelTag(na(manipExtreme) ? sessHigh : manipExtreme)
 
+// Auction Market Theory gate: a long is only in harmony with the auction if
+// price is trading ABOVE fair value (initiative buying / acceptance above
+// VWAP), or the manipulation leg reached BELOW the lower value-area band and
+// was rejected (excess low -> responsive buying). Shorts mirror. This keeps
+// entries from fading a one-sided auction from the wrong side of value.
+vwapSweepRejLong  = not na(manipExtreme) and manipExtreme <= vwapLower1
+vwapSweepRejShort = not na(manipExtreme) and manipExtreme >= vwapUpper1
+vwapGateLong  = not requireVwapAMT or close > vwapValue or vwapSweepRejLong
+vwapGateShort = not requireVwapAMT or close < vwapValue or vwapSweepRejShort
+vwapTagLong   = close > vwapValue ? " [AMT: >VWAP]" : vwapSweepRejLong  ? " [AMT: VA reject]" : ""
+vwapTagShort  = close < vwapValue ? " [AMT: <VWAP]" : vwapSweepRejShort ? " [AMT: VA reject]" : ""
+
 // Entry assembly — chart timeframe (original behavior, unchanged gates)
 // ---------------------------------------------------------------------------
 canEnter = sessActive and not sessTaken and (not requireSweep or sessSwept)
 
-longSignal  = canEnter and biasIsLong       and (tier1Long  or tier2Long)  and smtOkLong  and newsGateOk and newsBiasOkLong  and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
-shortSignal = canEnter and (not biasIsLong) and (tier1Short or tier2Short) and smtOkShort and newsGateOk and newsBiasOkShort and amdGateShort and quarterlyGateOk and htfIfvgGateShort
+longSignal  = canEnter and biasIsLong       and (tier1Long  or tier2Long)  and smtOkLong  and newsGateOk and newsBiasOkLong  and amdGateLong  and quarterlyGateOk and htfIfvgGateLong and vwapGateLong
+shortSignal = canEnter and (not biasIsLong) and (tier1Short or tier2Short) and smtOkShort and newsGateOk and newsBiasOkShort and amdGateShort and quarterlyGateOk and htfIfvgGateShort and vwapGateShort
 
 if longSignal
     sessTaken := true
     stopLevel = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel, bar_index + boxExtendBars, stopLevel, color = color.red, style = line.style_dashed)
-    label.new(bar_index, low, text = "PO3 LONG (" + sessName + ")\n" + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 LONG (" + sessName + ")\n" + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong + vwapTagLong, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Long ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagLong + klTagLong + vwapTagLong, alert.freq_once_per_bar)
 
 if shortSignal
     sessTaken := true
     stopLevel = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel, bar_index + boxExtendBars, stopLevel, color = color.red, style = line.style_dashed)
-    label.new(bar_index, high, text = "PO3 SHORT (" + sessName + ")\n" + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 SHORT (" + sessName + ")\n" + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort + vwapTagShort, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | chart TF | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel) + " | " + (tier1Short ? "IFVG(" + tier1Source + ")" : "CISD") + amdTagShort + klTagShort + vwapTagShort, alert.freq_once_per_bar)
 
 // ---------------------------------------------------------------------------
 // Entry assembly — independent 15m / 5m signals. Same session/manipulation
@@ -948,38 +988,38 @@ if shortSignal
 canEnter15m = enable15m and sessActive and not sessTaken15m and (not requireSweep or sessSwept)
 canEnter5m  = enable5m  and sessActive and not sessTaken5m  and (not requireSweep or sessSwept)
 
-longSignal_15m  = canEnter15m and biasIsLong       and confLong_15m  and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
-shortSignal_15m = canEnter15m and (not biasIsLong) and confShort_15m and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort
-longSignal_5m   = canEnter5m  and biasIsLong       and confLong_5m   and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong
-shortSignal_5m  = canEnter5m  and (not biasIsLong) and confShort_5m  and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort
+longSignal_15m  = canEnter15m and biasIsLong       and confLong_15m  and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong and vwapGateLong
+shortSignal_15m = canEnter15m and (not biasIsLong) and confShort_15m and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort and vwapGateShort
+longSignal_5m   = canEnter5m  and biasIsLong       and confLong_5m   and smtOkLong  and newsGateOk and newsBiasOkLong  and barstate.isconfirmed and amdGateLong  and quarterlyGateOk and htfIfvgGateLong and vwapGateLong
+shortSignal_5m  = canEnter5m  and (not biasIsLong) and confShort_5m  and smtOkShort and newsGateOk and newsBiasOkShort and barstate.isconfirmed and amdGateShort and quarterlyGateOk and htfIfvgGateShort and vwapGateShort
 
 if longSignal_15m
     sessTaken15m := true
     stopLevel15 = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel15, bar_index + boxExtendBars, stopLevel15, color = color.orange, style = line.style_dotted)
-    label.new(bar_index, low, text = "PO3 15m LONG (" + sessName + ")\n" + confSrc_15m_long + amdTagLong + klTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.lime, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_long + amdTagLong + klTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 15m LONG (" + sessName + ")\n" + confSrc_15m_long + amdTagLong + klTagLong + vwapTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.lime, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_long + amdTagLong + klTagLong + vwapTagLong, alert.freq_once_per_bar)
 
 if shortSignal_15m
     sessTaken15m := true
     stopLevel15 = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel15, bar_index + boxExtendBars, stopLevel15, color = color.orange, style = line.style_dotted)
-    label.new(bar_index, high, text = "PO3 15m SHORT (" + sessName + ")\n" + confSrc_15m_short + amdTagShort + klTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.orange, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_short + amdTagShort + klTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 15m SHORT (" + sessName + ")\n" + confSrc_15m_short + amdTagShort + klTagShort + vwapTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.orange, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | 15m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel15) + " | " + confSrc_15m_short + amdTagShort + klTagShort + vwapTagShort, alert.freq_once_per_bar)
 
 if longSignal_5m
     sessTaken5m := true
     stopLevel5 = na(manipExtreme) ? sessLow : manipExtreme
     line.new(bar_index, stopLevel5, bar_index + boxExtendBars, stopLevel5, color = color.aqua, style = line.style_dotted)
-    label.new(bar_index, low, text = "PO3 5m LONG (" + sessName + ")\n" + confSrc_5m_long + amdTagLong + klTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.aqua, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
-    alert("PO3 LONG | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_long + amdTagLong + klTagLong, alert.freq_once_per_bar)
+    label.new(bar_index, low, text = "PO3 5m LONG (" + sessName + ")\n" + confSrc_5m_long + amdTagLong + klTagLong + vwapTagLong + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_up, color = color.new(color.aqua, 25), textcolor = color.black, size = size.tiny, yloc = yloc.belowbar)
+    alert("PO3 LONG | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_long + amdTagLong + klTagLong + vwapTagLong, alert.freq_once_per_bar)
 
 if shortSignal_5m
     sessTaken5m := true
     stopLevel5 = na(manipExtreme) ? sessHigh : manipExtreme
     line.new(bar_index, stopLevel5, bar_index + boxExtendBars, stopLevel5, color = color.fuchsia, style = line.style_dotted)
-    label.new(bar_index, high, text = "PO3 5m SHORT (" + sessName + ")\n" + confSrc_5m_short + amdTagShort + klTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.fuchsia, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
-    alert("PO3 SHORT | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_short + amdTagShort + klTagShort, alert.freq_once_per_bar)
+    label.new(bar_index, high, text = "PO3 5m SHORT (" + sessName + ")\n" + confSrc_5m_short + amdTagShort + klTagShort + vwapTagShort + (inNewsCatalyst ? " [NEWS]" : ""), style = label.style_label_down, color = color.new(color.fuchsia, 25), textcolor = color.black, size = size.tiny, yloc = yloc.abovebar)
+    alert("PO3 SHORT | " + sessName + " | 5m | entry " + str.tostring(close) + " | stop " + str.tostring(stopLevel5) + " | " + confSrc_5m_short + amdTagShort + klTagShort + vwapTagShort, alert.freq_once_per_bar)
 
 // ---------------------------------------------------------------------------
 // Alerts: a small fixed set of alertcondition()s for the Create Alert dialog
@@ -1203,3 +1243,13 @@ if showKeyLevels and barstate.islast
 //    across both symbol columns; it is not duplicated per-symbol because
 //    session/news timing is identical for ES and NQ.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// VWAP plots (global scope, gated by showVwap via na-series)
+// ---------------------------------------------------------------------------
+plot(showVwap ? vwapValue : na, title = "VWAP", color = #2962FF, linewidth = 2)
+vwapU1plot = plot(showVwap ? vwapUpper1 : na, title = "VWAP Upper VA Band", color = color.green)
+vwapL1plot = plot(showVwap ? vwapLower1 : na, title = "VWAP Lower VA Band", color = color.green)
+fill(vwapU1plot, vwapL1plot, title = "VWAP Value Area", color = color.new(color.green, 95))
+plot(showVwap ? vwapUpper2 : na, title = "VWAP Upper Excess Band", color = color.teal)
+plot(showVwap ? vwapLower2 : na, title = "VWAP Lower Excess Band", color = color.teal)
